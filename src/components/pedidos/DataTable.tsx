@@ -1,14 +1,5 @@
 /**
  * DataTable – Painel de Confirmar Entrega (Nobre Lar)
- *
- * Funcionalidades:
- *  - Exibe pedidos com NIVEL ENTREGA = NORMAL
- *  - Coluna DATA (data do pedido)
- *  - Filtro por intervalo de datas (De / Até) baseado na coluna DATA
- *  - Pedidos ordenados do mais recente ao mais antigo
- *  - Botão "Confirmar Entrega" registra data/hora automaticamente (hora do clique)
- *  - Opção de inserir data e hora manualmente antes de confirmar
- *  - Alimenta a planilha via Apps Script (POST)
  */
 
 import { useState, useEffect, useCallback, useMemo } from "react";
@@ -41,7 +32,7 @@ interface Pedido {
   "VALOR DO PEDIDO": string | number;
   VENDEDOR: string;
   "NIVEL ENTREGA": string;
-  DATA?: string;           // data do pedido (coluna DATA da planilha)
+  DATA?: string;
   "ENTREGUE DATA"?: string;
   "ENTREGUE HORA"?: string;
   [key: string]: unknown;
@@ -77,10 +68,6 @@ function formatCurrency(value: string | number): string {
   return num.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
 
-/**
- * Converte "dd/MM/yy" ou "dd/MM/yyyy" → Date (meia-noite local).
- * Retorna null se o formato não for reconhecido.
- */
 function parseDateBR(str: string): Date | null {
   if (!str) return null;
   const parts = String(str).trim().split("/");
@@ -91,12 +78,22 @@ function parseDateBR(str: string): Date | null {
   return isNaN(d.getTime()) ? null : d;
 }
 
-/** Converte "yyyy-MM-dd" (valor de <input type="date">) → Date local */
 function parseInputDate(str: string): Date | null {
   if (!str) return null;
   const [y, m, d] = str.split("-").map(Number);
   const dt = new Date(y, m - 1, d);
   return isNaN(dt.getTime()) ? null : dt;
+}
+
+/** Monta URL do Apps Script com query params — evita o problema de CORS do POST */
+function buildUrl(params: Record<string, string | number>): string {
+  const qs = new URLSearchParams(
+    Object.entries(params).reduce(
+      (acc, [k, v]) => ({ ...acc, [k]: String(v) }),
+      {} as Record<string, string>
+    )
+  ).toString();
+  return `${SCRIPT_URL}?${qs}`;
 }
 
 // ─── component ───────────────────────────────────────────────────────────────
@@ -106,11 +103,9 @@ export default function DataTable() {
   const [loading, setLoading]         = useState(true);
   const [confirmando, setConfirmando] = useState<number | null>(null);
 
-  // filtro de intervalo
-  const [filtroDe,  setFiltroDe]  = useState("");   // yyyy-MM-dd
-  const [filtroAte, setFiltroAte] = useState("");   // yyyy-MM-dd
+  const [filtroDe,  setFiltroDe]  = useState("");
+  const [filtroAte, setFiltroAte] = useState("");
 
-  // dialog de confirmação
   const [dialogOpen,   setDialogOpen]   = useState(false);
   const [dialogPedido, setDialogPedido] = useState<Pedido | null>(null);
   const [manualData,   setManualData]   = useState("");
@@ -122,7 +117,8 @@ export default function DataTable() {
   const fetchPedidos = useCallback(async () => {
     setLoading(true);
     try {
-      const res  = await fetch(`${SCRIPT_URL}?nivel=NORMAL`);
+      const url  = buildUrl({ action: "listar", secret: SCRIPT_SECRET, nivel: "NORMAL" });
+      const res  = await fetch(url);
       const json = await res.json();
       if (!json.ok) throw new Error(json.error);
       setPedidos(json.rows as Pedido[]);
@@ -135,27 +131,25 @@ export default function DataTable() {
 
   useEffect(() => { fetchPedidos(); }, [fetchPedidos]);
 
-  // ── ordenação + filtro por intervalo de datas ────────────────────────────
+  // ── ordenação + filtro ────────────────────────────────────────────────────
 
   const pedidosFiltrados = useMemo(() => {
     const deDate  = parseInputDate(filtroDe);
     const ateDate = parseInputDate(filtroAte);
 
     return [...pedidos]
-      // ordena do mais recente ao mais antigo
       .sort((a, b) => {
         const da = parseDateBR(a.DATA ?? "");
         const db = parseDateBR(b.DATA ?? "");
-        if (!da && !db) return b._row - a._row;  // fallback: ordem inversa da planilha
+        if (!da && !db) return b._row - a._row;
         if (!da) return 1;
         if (!db) return -1;
         return db.getTime() - da.getTime();
       })
-      // filtra por intervalo
       .filter(p => {
         if (!deDate && !ateDate) return true;
         const dp = parseDateBR(p.DATA ?? "");
-        if (!dp) return true; // mantém pedidos sem data
+        if (!dp) return true;
         if (deDate  && dp < deDate)  return false;
         if (ateDate && dp > ateDate) return false;
         return true;
@@ -164,12 +158,44 @@ export default function DataTable() {
 
   const temFiltro = filtroDe || filtroAte;
 
-  function limparFiltro() {
-    setFiltroDe("");
-    setFiltroAte("");
-  }
+  // ── confirmar entrega via GET (evita CORS do POST) ────────────────────────
 
-  // ── dialog ────────────────────────────────────────────────────────────────
+  async function confirmarEntrega(pedido: Pedido, data?: string, hora?: string) {
+    setConfirmando(pedido._row);
+    setDialogOpen(false);
+    try {
+      const params: Record<string, string | number> = {
+        action: "confirmar",
+        secret: SCRIPT_SECRET,
+        row   : pedido._row,
+      };
+      // se modo automático, não envia data/hora — o servidor usa o momento atual
+      if (data) params.data = data;
+      if (hora) params.hora = hora;
+
+      const url  = buildUrl(params);
+      const res  = await fetch(url);
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error);
+
+      toast.success(
+        `✅ Pedido ${pedido.PEDIDO} confirmado: ${json.data} às ${json.hora}`
+      );
+
+      // atualiza o estado local imediatamente
+      setPedidos(prev =>
+        prev.map(p =>
+          p._row === pedido._row
+            ? { ...p, "ENTREGUE DATA": json.data, "ENTREGUE HORA": json.hora }
+            : p
+        )
+      );
+    } catch (err) {
+      toast.error("Erro ao confirmar entrega: " + (err as Error).message);
+    } finally {
+      setConfirmando(null);
+    }
+  }
 
   function abrirConfirmacao(pedido: Pedido) {
     setDialogPedido(pedido);
@@ -179,50 +205,12 @@ export default function DataTable() {
     setDialogOpen(true);
   }
 
-  // ── confirmar entrega (POST) ──────────────────────────────────────────────
-
-  async function confirmarEntrega(pedido: Pedido, data?: string, hora?: string) {
-    setConfirmando(pedido._row);
-    setDialogOpen(false);
-    try {
-      const body = {
-        secret: SCRIPT_SECRET,
-        action: "confirmar",
-        row   : pedido._row,
-        ...(data ? { data } : {}),
-        ...(hora ? { hora } : {}),
-      };
-
-      const res  = await fetch(SCRIPT_URL, {
-        method : "POST",
-        headers: { "Content-Type": "application/json" },
-        body   : JSON.stringify(body),
-      });
-      const json = await res.json();
-      if (!json.ok) throw new Error(json.error);
-
-      toast.success(`Entrega confirmada — Pedido ${pedido.PEDIDO}: ${json.data} às ${json.hora}`);
-
-      setPedidos(prev =>
-        prev.map(p =>
-          p._row === pedido._row
-            ? { ...p, "ENTREGUE DATA": json.data, "ENTREGUE HORA": json.hora }
-            : p
-        )
-      );
-    } catch (err) {
-      toast.error("Erro ao confirmar: " + (err as Error).message);
-    } finally {
-      setConfirmando(null);
-    }
-  }
-
   function handleDialogConfirmar() {
     if (!dialogPedido) return;
     if (modoManual) {
       confirmarEntrega(dialogPedido, manualData, manualHora);
     } else {
-      confirmarEntrega(dialogPedido);
+      confirmarEntrega(dialogPedido); // sem data/hora → servidor usa agora
     }
   }
 
@@ -246,10 +234,9 @@ export default function DataTable() {
         </Button>
       </div>
 
-      {/* ── filtro de intervalo de datas ─────────────────────────────────── */}
+      {/* filtro de intervalo */}
       <div className="flex flex-wrap items-end gap-3 rounded-xl border bg-gray-50 px-4 py-3">
         <CalendarRange className="w-4 h-4 text-gray-400 self-center shrink-0" />
-
         <div className="space-y-1">
           <label className="text-xs font-medium text-gray-500">De</label>
           <Input
@@ -259,7 +246,6 @@ export default function DataTable() {
             className="w-40 text-sm bg-white"
           />
         </div>
-
         <div className="space-y-1">
           <label className="text-xs font-medium text-gray-500">Até</label>
           <Input
@@ -269,12 +255,11 @@ export default function DataTable() {
             className="w-40 text-sm bg-white"
           />
         </div>
-
         {temFiltro && (
           <Button
             variant="ghost"
             size="sm"
-            onClick={limparFiltro}
+            onClick={() => { setFiltroDe(""); setFiltroAte(""); }}
             className="text-gray-500 hover:text-gray-700 self-end"
           >
             <X className="w-3.5 h-3.5 mr-1" />
@@ -283,7 +268,7 @@ export default function DataTable() {
         )}
       </div>
 
-      {/* ── tabela ───────────────────────────────────────────────────────── */}
+      {/* tabela */}
       <div className="rounded-xl border overflow-x-auto shadow-sm">
         <Table>
           <TableHeader>
@@ -327,38 +312,25 @@ export default function DataTable() {
                   key={pedido._row}
                   className={jaEntregue ? "bg-green-50" : ""}
                 >
-                  {/* nº pedido */}
                   <TableCell className="font-mono font-medium">
                     {String(pedido.PEDIDO)}
                   </TableCell>
-
-                  {/* data do pedido */}
                   <TableCell className="tabular-nums text-gray-700">
                     {pedido.DATA
                       ? <span className="font-medium">{pedido.DATA}</span>
                       : <span className="text-gray-300">—</span>
                     }
                   </TableCell>
-
-                  {/* valor */}
                   <TableCell className="text-right tabular-nums">
                     {formatCurrency(pedido["VALOR DO PEDIDO"])}
                   </TableCell>
-
-                  {/* vendedor */}
                   <TableCell>{pedido.VENDEDOR || "—"}</TableCell>
-
-                  {/* entregue data */}
                   <TableCell className="tabular-nums">
                     {pedido["ENTREGUE DATA"] || <span className="text-gray-300">—</span>}
                   </TableCell>
-
-                  {/* entregue hora */}
                   <TableCell className="tabular-nums">
                     {pedido["ENTREGUE HORA"] || <span className="text-gray-300">—</span>}
                   </TableCell>
-
-                  {/* ação */}
                   <TableCell className="text-center">
                     {jaEntregue ? (
                       <Badge
@@ -377,7 +349,7 @@ export default function DataTable() {
                       >
                         {emProgresso
                           ? <Loader2 className="w-4 h-4 animate-spin" />
-                          : <><CheckCircle2 className="w-4 h-4 mr-1" /> Confirmar Entrega</>
+                          : <><CheckCircle2 className="w-4 h-4 mr-1" />Confirmar Entrega</>
                         }
                       </Button>
                     )}
@@ -389,7 +361,7 @@ export default function DataTable() {
         </Table>
       </div>
 
-      {/* ── dialog de confirmação ─────────────────────────────────────────── */}
+      {/* dialog */}
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent className="max-w-md">
           <DialogHeader>
@@ -401,7 +373,6 @@ export default function DataTable() {
 
           {dialogPedido && (
             <div className="space-y-4">
-              {/* resumo */}
               <div className="rounded-lg bg-gray-50 p-3 space-y-1 text-sm">
                 <div className="flex justify-between">
                   <span className="text-gray-500">Pedido</span>
@@ -423,7 +394,6 @@ export default function DataTable() {
                 </div>
               </div>
 
-              {/* toggle */}
               <div className="flex items-center gap-3">
                 <button
                   type="button"
@@ -450,7 +420,6 @@ export default function DataTable() {
                 </button>
               </div>
 
-              {/* campos manuais */}
               {modoManual && (
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1">
