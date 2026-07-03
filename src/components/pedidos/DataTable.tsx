@@ -186,7 +186,7 @@ export default function DataTable() {
       setPedidos(prev =>
         prev.map(p =>
           p._row === pedido._row
-            ? { ...p, "ENTREGUE DATA": json.data, "ENTREGUE HORA": json.hora }
+            ? { ...p, "ENTREGUE DATA": json.data, "ENTREGUE HORA": json.hora, LOGISTICA: "ENTREGUE" }
             : p
         )
       );
