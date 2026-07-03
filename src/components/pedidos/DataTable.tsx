@@ -1,524 +1,396 @@
-import { useMemo, useState } from "react";
+/**
+ * DataTable – Painel de Confirmar Entrega (Nobre Lar)
+ *
+ * Funcionalidades:
+ *  - Exibe pedidos com NIVEL ENTREGA = NORMAL
+ *  - Botão "Confirmar Entrega" registra data/hora automaticamente (hora do clique)
+ *  - Opção de inserir data e hora manualmente antes de confirmar
+ *  - Alimenta a planilha via Apps Script (POST)
+ */
+
+import { useState, useEffect, useCallback } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
 import {
-  ChevronLeft,
-  ChevronRight,
-  CheckCircle2,
-  Search,
-  Package,
-  TrendingUp,
-  Clock,
-  RefreshCw,
-  X,
-} from "lucide-react";
-import { confirmarEntrega, fetchPedidos, isConfigured, type Pedido } from "@/lib/pedidos-api";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { toast } from "sonner";
+import { CheckCircle2, Clock, RefreshCw, Loader2 } from "lucide-react";
 
-const ROWS = 10;
+// ─── tipos ───────────────────────────────────────────────────────────────────
 
-function toBRL(v: unknown) {
-  const n = typeof v === "number" ? v : parseFloat(String(v ?? "").replace(",", "."));
-  if (!isFinite(n)) return "—";
-  return n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+interface Pedido {
+  _row: number;
+  PEDIDO: string | number;
+  "VALOR DO PEDIDO": string | number;
+  VENDEDOR: string;
+  "NIVEL ENTREGA": string;
+  "ENTREGUE DATA"?: string;
+  "ENTREGUE HORA"?: string;
+  [key: string]: unknown;
 }
 
-function initials(name: string) {
-  return name
-    .trim()
-    .split(/\s+/)
-    .map((n) => n[0])
-    .join("")
-    .slice(0, 2)
-    .toUpperCase();
+// ─── env ─────────────────────────────────────────────────────────────────────
+
+const SCRIPT_URL    = import.meta.env.VITE_APPS_SCRIPT_URL  as string;
+const SCRIPT_SECRET = import.meta.env.VITE_APPS_SCRIPT_SECRET as string;
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+function nowDate(): string {
+  const d = new Date();
+  const dd  = String(d.getDate()).padStart(2, "0");
+  const mm  = String(d.getMonth() + 1).padStart(2, "0");
+  const yy  = String(d.getFullYear()).slice(-2);
+  return `${dd}/${mm}/${yy}`;
 }
+
+function nowTime(): string {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function formatCurrency(value: string | number): string {
+  const num = typeof value === "number" ? value : parseFloat(String(value).replace(",", "."));
+  if (isNaN(num)) return String(value);
+  return num.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+// ─── component ───────────────────────────────────────────────────────────────
 
 export default function DataTable() {
-  const qc = useQueryClient();
-  const [page, setPage] = useState(1);
-  const [search, setSearch] = useState("");
-  const [dateFrom, setDateFrom] = useState(""); // yyyy-mm-dd
-  const [dateTo, setDateTo] = useState(""); // yyyy-mm-dd
-  const [modal, setModal] = useState<Pedido | null>(null);
-  const [manualDate, setManualDate] = useState("");
-  const [manualTime, setManualTime] = useState("");
-  const [useManual, setUseManual] = useState(false);
+  const [pedidos, setPedidos]       = useState<Pedido[]>([]);
+  const [loading, setLoading]       = useState(true);
+  const [confirmando, setConfirmando] = useState<number | null>(null); // _row em progresso
 
-  const configured = isConfigured();
+  // dialog de confirmação manual
+  const [dialogOpen, setDialogOpen]   = useState(false);
+  const [dialogPedido, setDialogPedido] = useState<Pedido | null>(null);
+  const [manualData, setManualData]   = useState("");
+  const [manualHora, setManualHora]   = useState("");
+  const [modoManual, setModoManual]   = useState(false);
 
-  const query = useQuery({
-    queryKey: ["pedidos"],
-    queryFn: fetchPedidos,
-    enabled: configured,
-    refetchInterval: 60_000,
-  });
+  // ── carregar pedidos ──────────────────────────────────────────────────────
 
-  const mutation = useMutation({
-    mutationFn: confirmarEntrega,
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["pedidos"] });
-      setModal(null);
-      setUseManual(false);
-      setManualDate("");
-      setManualTime("");
-    },
-  });
-
-  const rows = query.data ?? [];
-
-  // Normaliza DATA do pedido para yyyy-mm-dd
-  const normalizeDate = (v: unknown): string => {
-    const s = String(v ?? "").trim();
-    if (!s) return "";
-    // dd/mm/yyyy ou dd/mm/yy
-    const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
-    if (m) {
-      const d = m[1].padStart(2, "0");
-      const mo = m[2].padStart(2, "0");
-      let y = m[3];
-      if (y.length === 2) y = "20" + y;
-      return `${y}-${mo}-${d}`;
+  const fetchPedidos = useCallback(async () => {
+    setLoading(true);
+    try {
+      // ?nivel=NORMAL filtra no servidor — Apps Script retorna só os normais
+      const res  = await fetch(`${SCRIPT_URL}?nivel=NORMAL`);
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error);
+      setPedidos(json.rows as Pedido[]);
+    } catch (err) {
+      toast.error("Erro ao carregar pedidos: " + (err as Error).message);
+    } finally {
+      setLoading(false);
     }
-    // ISO
-    const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-    if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-    return "";
-  };
+  }, []);
 
-  const filtered = useMemo(() => {
-    const s = search.toLowerCase();
-    let out = rows;
-    if (s) {
-      out = out.filter((r) =>
-        [r.PEDIDO, r.VENDEDOR, r.CIDADE, r.LOJA, r.RESPONSAVEL]
-          .map((v) => String(v ?? "").toLowerCase())
-          .some((v) => v.includes(s)),
-      );
-    }
-    if (dateFrom || dateTo) {
-      out = out.filter((r) => {
-        const d = normalizeDate(r.DATA);
-        if (!d) return false;
-        if (dateFrom && d < dateFrom) return false;
-        if (dateTo && d > dateTo) return false;
-        return true;
-      });
-    }
-    // Ordena pelos mais recentes primeiro (última linha adicionada na planilha)
-    return [...out].sort((a, b) => Number(b._row) - Number(a._row));
-  }, [rows, search, dateFrom, dateTo]);
+  useEffect(() => { fetchPedidos(); }, [fetchPedidos]);
 
-  const totalPages = Math.max(1, Math.ceil(filtered.length / ROWS));
-  const start = (page - 1) * ROWS;
-  const pageData = filtered.slice(start, start + ROWS);
+  // ── abrir dialog ──────────────────────────────────────────────────────────
 
-  const entregues = rows.filter((r) => String(r["ENTREGUE DATA"] ?? "").trim()).length;
-  const pendentes = rows.length - entregues;
-
-  const openConfirm = (p: Pedido) => {
-    setModal(p);
-    const now = new Date();
-    setManualDate(
-      now.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit", year: "2-digit" }),
-    );
-    setManualTime(now.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }));
-    setUseManual(false);
-  };
-
-  const doConfirm = () => {
-    if (!modal) return;
-    mutation.mutate({
-      row: modal._row,
-      data: useManual ? manualDate : undefined,
-      hora: useManual ? manualTime : undefined,
-    });
-  };
-
-  if (!configured) {
-    return (
-      <div className="rounded-2xl border border-amber-300 bg-amber-50 dark:border-amber-900/40 dark:bg-amber-900/10 p-6 text-sm text-amber-900 dark:text-amber-200">
-        <p className="font-semibold mb-2">Backend não configurado</p>
-        <p>
-          Configure <code>VITE_APPS_SCRIPT_URL</code> e <code>VITE_APPS_SCRIPT_SECRET</code> no
-          arquivo <code>.env</code>. Veja instruções em <code>docs/apps-script/README.md</code>.
-        </p>
-      </div>
-    );
+  function abrirConfirmacao(pedido: Pedido) {
+    setDialogPedido(pedido);
+    setModoManual(false);
+    setManualData(nowDate());
+    setManualHora(nowTime());
+    setDialogOpen(true);
   }
 
+  // ── confirmar entrega (POST) ──────────────────────────────────────────────
+
+  async function confirmarEntrega(pedido: Pedido, data?: string, hora?: string) {
+    setConfirmando(pedido._row);
+    setDialogOpen(false);
+    try {
+      const body = {
+        secret : SCRIPT_SECRET,
+        action : "confirmar",
+        row    : pedido._row,
+        // se não passar data/hora, o Apps Script usa o horário atual do servidor
+        ...(data ? { data } : {}),
+        ...(hora ? { hora } : {}),
+      };
+
+      const res  = await fetch(SCRIPT_URL, {
+        method  : "POST",
+        headers : { "Content-Type": "application/json" },
+        body    : JSON.stringify(body),
+      });
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error);
+
+      toast.success(
+        `Entrega confirmada — Pedido ${pedido.PEDIDO}: ${json.data} às ${json.hora}`
+      );
+
+      // atualiza localmente sem recarregar tudo
+      setPedidos(prev =>
+        prev.map(p =>
+          p._row === pedido._row
+            ? { ...p, "ENTREGUE DATA": json.data, "ENTREGUE HORA": json.hora }
+            : p
+        )
+      );
+    } catch (err) {
+      toast.error("Erro ao confirmar: " + (err as Error).message);
+    } finally {
+      setConfirmando(null);
+    }
+  }
+
+  function handleConfirmarClick(pedido: Pedido) {
+    abrirConfirmacao(pedido);
+  }
+
+  function handleDialogConfirmar() {
+    if (!dialogPedido) return;
+    if (modoManual) {
+      confirmarEntrega(dialogPedido, manualData, manualHora);
+    } else {
+      // usa hora exata do clique — não passa data/hora, Apps Script registra o agora
+      confirmarEntrega(dialogPedido);
+    }
+  }
+
+  // ─── render ────────────────────────────────────────────────────────────────
+
   return (
-    <div className="space-y-4">
-      {/* Resumo */}
-      <div className="grid grid-cols-3 gap-3">
-        <SummaryCard
-          label="Total"
-          value={rows.length}
-          icon={<Package className="w-4 h-4 text-blue-600 dark:text-blue-400" />}
-          tone="blue"
-        />
-        <SummaryCard
-          label="Pendentes"
-          value={pendentes}
-          icon={<TrendingUp className="w-4 h-4 text-amber-600 dark:text-amber-400" />}
-          tone="amber"
-        />
-        <SummaryCard
-          label="Entregues"
-          value={entregues}
-          icon={<CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />}
-          tone="emerald"
-        />
+    <div className="p-4 space-y-4">
+
+      {/* cabeçalho */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-xl font-semibold text-gray-900">Pedidos — Nível Normal</h2>
+          <p className="text-sm text-gray-500">{pedidos.length} pedido(s) carregado(s)</p>
+        </div>
+        <Button variant="outline" size="sm" onClick={fetchPedidos} disabled={loading}>
+          <RefreshCw className={`w-4 h-4 mr-2 ${loading ? "animate-spin" : ""}`} />
+          Atualizar
+        </Button>
       </div>
 
-      {/* Ações */}
-      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-        <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-          <input
-            type="text"
-            placeholder="Buscar pedido, vendedor, cidade..."
-            value={search}
-            onChange={(e) => {
-              setSearch(e.target.value);
-              setPage(1);
-            }}
-            className="w-full pl-9 pr-4 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-          />
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-2">
-            <input
-              type="date"
-              value={dateFrom}
-              onChange={(e) => {
-                setDateFrom(e.target.value);
-                setPage(1);
-              }}
-              className="px-3 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/30 text-slate-700 dark:text-slate-200"
-            />
-            <span className="text-xs text-slate-500 dark:text-slate-400">até</span>
-            <input
-              type="date"
-              value={dateTo}
-              onChange={(e) => {
-                setDateTo(e.target.value);
-                setPage(1);
-              }}
-              className="px-3 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/30 text-slate-700 dark:text-slate-200"
-            />
-          </div>
-          {(dateFrom || dateTo) && (
-            <button
-              onClick={() => {
-                setDateFrom("");
-                setDateTo("");
-                setPage(1);
-              }}
-              className="px-2.5 py-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
-              aria-label="Limpar filtro de data"
-            >
-              Limpar
-            </button>
-          )}
-          <button
-            onClick={() => query.refetch()}
-            className="p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800"
-            aria-label="Recarregar"
-          >
-            <RefreshCw
-              className={`w-4 h-4 text-slate-600 dark:text-slate-300 ${query.isFetching ? "animate-spin" : ""}`}
-            />
-          </button>
-        </div>
-      </div>
+      {/* tabela */}
+      <div className="rounded-xl border overflow-x-auto shadow-sm">
+        <Table>
+          <TableHeader>
+            <TableRow className="bg-gray-50">
+              <TableHead className="font-semibold">Nº Pedido</TableHead>
+              <TableHead className="font-semibold">Valor</TableHead>
+              <TableHead className="font-semibold">Vendedor</TableHead>
+              <TableHead className="font-semibold">Entregue Data</TableHead>
+              <TableHead className="font-semibold">Entregue Hora</TableHead>
+              <TableHead className="font-semibold text-center">Ação</TableHead>
+            </TableRow>
+          </TableHeader>
 
-      {query.isError && (
-        <div className="rounded-xl border border-red-300 bg-red-50 dark:border-red-900/40 dark:bg-red-900/10 p-3 text-sm text-red-800 dark:text-red-300">
-          {(query.error as Error).message}
-        </div>
-      )}
+          <TableBody>
+            {loading && (
+              <TableRow>
+                <TableCell colSpan={6} className="text-center py-12 text-gray-400">
+                  <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" />
+                  Carregando pedidos…
+                </TableCell>
+              </TableRow>
+            )}
 
-      {/* Cards mobile */}
-      <div className="lg:hidden space-y-3">
-        {pageData.map((r) => {
-          const entregue = Boolean(String(r["ENTREGUE DATA"] ?? "").trim());
-          return (
-            <div
-              key={r._row}
-              className="bg-white dark:bg-slate-900 rounded-2xl p-4 border border-slate-200 dark:border-slate-800 shadow-sm space-y-3"
-            >
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold">
-                    {initials(String(r.VENDEDOR || r.LOJA || "?"))}
-                  </div>
-                  <div>
-                    <p className="text-sm font-semibold text-slate-800 dark:text-white">
-                      {r.VENDEDOR || "—"}
-                    </p>
-                    <p className="text-xs text-slate-500 dark:text-slate-400 font-mono">
-                      #{r.PEDIDO} · {r.LOJA}
-                    </p>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">{r.CIDADE}</p>
-                  </div>
-                </div>
-                <div className="text-right">
-                  <span className="block text-sm font-bold text-slate-800 dark:text-white">
-                    {toBRL(r["VALOR DO PEDIDO"])}
-                  </span>
-                  {r.DATA && (
-                    <span className="block text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                      {r.DATA}
-                    </span>
-                  )}
-                </div>
-              </div>
-              {entregue ? (
-                <span className="inline-flex items-center justify-center w-full gap-1.5 px-4 py-2.5 text-sm font-medium rounded-xl bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400">
-                  <CheckCircle2 className="w-4 h-4" />
-                  Entregue {r["ENTREGUE DATA"]} {r["ENTREGUE HORA"]}
-                </span>
-              ) : (
-                <button
-                  onClick={() => openConfirm(r)}
-                  className="w-full flex items-center justify-center gap-1.5 px-4 py-2.5 text-sm font-medium rounded-xl bg-blue-600 text-white hover:bg-blue-700 active:scale-[0.98]"
-                >
-                  <CheckCircle2 className="w-4 h-4" />
-                  Confirmar entrega
-                </button>
-              )}
-            </div>
-          );
-        })}
-      </div>
+            {!loading && pedidos.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={6} className="text-center py-12 text-gray-400">
+                  Nenhum pedido com nível NORMAL encontrado.
+                </TableCell>
+              </TableRow>
+            )}
 
-      {/* Tabela desktop */}
-      <div className="hidden lg:block overflow-x-auto rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/80">
-              <Th>Pedido</Th>
-              <Th>Data</Th>
-              <Th>Loja</Th>
-              <Th>Vendedor</Th>
-              <Th>Cidade</Th>
-              <Th>Valor</Th>
-              <Th>Entrega</Th>
-              <Th>Ações</Th>
-            </tr>
-          </thead>
-          <tbody>
-            {pageData.map((r) => {
-              const entregue = Boolean(String(r["ENTREGUE DATA"] ?? "").trim());
+            {!loading && pedidos.map(pedido => {
+              const jaEntregue = !!(pedido["ENTREGUE DATA"] || pedido["ENTREGUE HORA"]);
+              const emProgresso = confirmando === pedido._row;
+
               return (
-                <tr
-                  key={r._row}
-                  className="border-b border-slate-100 dark:border-slate-800/50 hover:bg-slate-50 dark:hover:bg-slate-800/30"
+                <TableRow
+                  key={pedido._row}
+                  className={jaEntregue ? "bg-green-50" : ""}
                 >
-                  <td className="px-4 py-3 font-mono text-xs text-slate-500 dark:text-slate-400">
-                    #{r.PEDIDO}
-                  </td>
-                  <td className="px-4 py-3 text-xs text-slate-600 dark:text-slate-300 whitespace-nowrap">
-                    {r.DATA || "—"}
-                  </td>
-                  <td className="px-4 py-3 text-slate-800 dark:text-slate-200">{r.LOJA}</td>
-                  <td className="px-4 py-3">
-                    <div className="flex items-center gap-2">
-                      <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold">
-                        {initials(String(r.VENDEDOR || "?"))}
-                      </div>
-                      <span className="text-slate-800 dark:text-slate-200">
-                        {r.VENDEDOR || "—"}
-                      </span>
-                    </div>
-                  </td>
-                  <td className="px-4 py-3 text-slate-600 dark:text-slate-300">{r.CIDADE}</td>
-                  <td className="px-4 py-3 text-slate-800 dark:text-slate-200 font-medium">
-                    {toBRL(r["VALOR DO PEDIDO"])}
-                  </td>
-                  <td className="px-4 py-3 text-xs text-slate-500 dark:text-slate-400">
-                    {entregue ? `${r["ENTREGUE DATA"]} ${r["ENTREGUE HORA"]}` : "—"}
-                  </td>
-                  <td className="px-4 py-3">
-                    {entregue ? (
-                      <span className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400">
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        Entregue
-                      </span>
-                    ) : (
-                      <button
-                        onClick={() => openConfirm(r)}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-full bg-blue-600 text-white hover:bg-blue-700"
-                      >
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        Confirmar entrega
-                      </button>
+                  {/* nº pedido */}
+                  <TableCell className="font-mono font-medium">
+                    {String(pedido.PEDIDO)}
+                  </TableCell>
+
+                  {/* valor */}
+                  <TableCell className="text-right tabular-nums">
+                    {formatCurrency(pedido["VALOR DO PEDIDO"])}
+                  </TableCell>
+
+                  {/* vendedor */}
+                  <TableCell>{pedido.VENDEDOR || "—"}</TableCell>
+
+                  {/* entregue data */}
+                  <TableCell className="tabular-nums">
+                    {pedido["ENTREGUE DATA"] || (
+                      <span className="text-gray-300">—</span>
                     )}
-                  </td>
-                </tr>
+                  </TableCell>
+
+                  {/* entregue hora */}
+                  <TableCell className="tabular-nums">
+                    {pedido["ENTREGUE HORA"] || (
+                      <span className="text-gray-300">—</span>
+                    )}
+                  </TableCell>
+
+                  {/* ação */}
+                  <TableCell className="text-center">
+                    {jaEntregue ? (
+                      <Badge
+                        variant="outline"
+                        className="border-green-500 text-green-700 bg-green-50 gap-1"
+                      >
+                        <CheckCircle2 className="w-3 h-3" />
+                        Entregue
+                      </Badge>
+                    ) : (
+                      <Button
+                        size="sm"
+                        disabled={emProgresso}
+                        onClick={() => handleConfirmarClick(pedido)}
+                        className="bg-emerald-600 hover:bg-emerald-700 text-white"
+                      >
+                        {emProgresso
+                          ? <Loader2 className="w-4 h-4 animate-spin" />
+                          : <><CheckCircle2 className="w-4 h-4 mr-1" /> Confirmar Entrega</>
+                        }
+                      </Button>
+                    )}
+                  </TableCell>
+                </TableRow>
               );
             })}
-            {pageData.length === 0 && !query.isLoading && (
-              <tr>
-                <td colSpan={8} className="px-4 py-10 text-center text-sm text-slate-500">
-                  Nenhum pedido encontrado.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       </div>
 
-      {/* Paginação */}
-      <div className="flex items-center justify-between pt-2">
-        <span className="text-xs text-slate-500 dark:text-slate-400">
-          {filtered.length === 0 ? 0 : start + 1}-{Math.min(start + ROWS, filtered.length)} de{" "}
-          {filtered.length}
-        </span>
-        <div className="flex items-center gap-1">
-          <button
-            onClick={() => setPage((p) => Math.max(1, p - 1))}
-            disabled={page === 1}
-            className="p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-30"
-          >
-            <ChevronLeft className="w-4 h-4 text-slate-600 dark:text-slate-300" />
-          </button>
-          <span className="px-3 py-1 text-sm font-medium text-slate-800 dark:text-slate-200">
-            {page} / {totalPages}
-          </span>
-          <button
-            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-            disabled={page >= totalPages}
-            className="p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-30"
-          >
-            <ChevronRight className="w-4 h-4 text-slate-600 dark:text-slate-300" />
-          </button>
-        </div>
-      </div>
+      {/* ── dialog de confirmação ─────────────────────────────────────────── */}
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+              Confirmar Entrega
+            </DialogTitle>
+          </DialogHeader>
 
-      {/* Modal Confirmar */}
-      {modal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-          <div className="w-full max-w-md rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl">
-            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200 dark:border-slate-800">
-              <h3 className="text-base font-semibold text-slate-800 dark:text-white">
-                Confirmar entrega
-              </h3>
-              <button
-                onClick={() => setModal(null)}
-                className="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div className="p-5 space-y-4">
-              <div className="text-sm text-slate-600 dark:text-slate-300">
-                Pedido <span className="font-mono font-semibold">#{modal.PEDIDO}</span> —{" "}
-                {modal.CIDADE}
+          {dialogPedido && (
+            <div className="space-y-4">
+              {/* resumo do pedido */}
+              <div className="rounded-lg bg-gray-50 p-3 space-y-1 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Pedido</span>
+                  <span className="font-mono font-semibold">{String(dialogPedido.PEDIDO)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Valor</span>
+                  <span className="font-semibold text-emerald-700">
+                    {formatCurrency(dialogPedido["VALOR DO PEDIDO"])}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Vendedor</span>
+                  <span>{dialogPedido.VENDEDOR || "—"}</span>
+                </div>
               </div>
 
-              <label className="flex items-start gap-2 text-sm text-slate-700 dark:text-slate-300 cursor-pointer">
-                <input
-                  type="radio"
-                  checked={!useManual}
-                  onChange={() => setUseManual(false)}
-                  className="mt-1"
-                />
-                <div>
-                  <div className="font-medium">Usar horário atual</div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1">
-                    <Clock className="w-3 h-3" />O servidor registra a data e hora exatas do clique.
-                  </div>
-                </div>
-              </label>
+              {/* toggle manual / automático */}
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setModoManual(false)}
+                  className={`flex-1 rounded-lg border py-2 text-sm font-medium transition-colors ${
+                    !modoManual
+                      ? "border-emerald-500 bg-emerald-50 text-emerald-700"
+                      : "border-gray-200 text-gray-500 hover:border-gray-300"
+                  }`}
+                >
+                  <Clock className="w-4 h-4 inline mr-1" />
+                  Hora do clique
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setModoManual(true)}
+                  className={`flex-1 rounded-lg border py-2 text-sm font-medium transition-colors ${
+                    modoManual
+                      ? "border-blue-500 bg-blue-50 text-blue-700"
+                      : "border-gray-200 text-gray-500 hover:border-gray-300"
+                  }`}
+                >
+                  Inserir manualmente
+                </button>
+              </div>
 
-              <label className="flex items-start gap-2 text-sm text-slate-700 dark:text-slate-300 cursor-pointer">
-                <input
-                  type="radio"
-                  checked={useManual}
-                  onChange={() => setUseManual(true)}
-                  className="mt-1"
-                />
-                <div className="flex-1">
-                  <div className="font-medium">Informar manualmente</div>
-                  <div className="mt-2 grid grid-cols-2 gap-2">
-                    <input
-                      type="text"
-                      placeholder="dd/mm/aa"
-                      value={manualDate}
-                      onChange={(e) => setManualDate(e.target.value)}
-                      disabled={!useManual}
-                      className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm disabled:opacity-50"
-                    />
-                    <input
-                      type="text"
-                      placeholder="HH:mm"
-                      value={manualTime}
-                      onChange={(e) => setManualTime(e.target.value)}
-                      disabled={!useManual}
-                      className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm disabled:opacity-50"
+              {/* campos manuais */}
+              {modoManual && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium text-gray-600">
+                      Data (dd/MM/aa)
+                    </label>
+                    <Input
+                      placeholder="03/07/26"
+                      value={manualData}
+                      onChange={e => setManualData(e.target.value)}
+                      maxLength={8}
                     />
                   </div>
-                </div>
-              </label>
-
-              {mutation.isError && (
-                <div className="text-xs text-red-600 dark:text-red-400">
-                  {(mutation.error as Error).message}
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium text-gray-600">
+                      Hora (HH:mm)
+                    </label>
+                    <Input
+                      placeholder="14:30"
+                      value={manualHora}
+                      onChange={e => setManualHora(e.target.value)}
+                      maxLength={5}
+                    />
+                  </div>
                 </div>
               )}
-            </div>
-            <div className="flex justify-end gap-2 px-5 py-4 border-t border-slate-200 dark:border-slate-800">
-              <button
-                onClick={() => setModal(null)}
-                className="px-4 py-2 rounded-xl text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
-              >
-                Cancelar
-              </button>
-              <button
-                onClick={doConfirm}
-                disabled={mutation.isPending}
-                className="px-4 py-2 rounded-xl text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60"
-              >
-                {mutation.isPending ? "Salvando..." : "Confirmar"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
-function Th({ children }: { children: React.ReactNode }) {
-  return (
-    <th className="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300">
-      {children}
-    </th>
-  );
-}
+              {!modoManual && (
+                <p className="text-xs text-gray-400 text-center">
+                  A data e hora exata do clique serão registradas automaticamente.
+                </p>
+              )}
+            </div>
+          )}
 
-function SummaryCard({
-  label,
-  value,
-  icon,
-  tone,
-}: {
-  label: string;
-  value: number;
-  icon: React.ReactNode;
-  tone: "blue" | "amber" | "emerald";
-}) {
-  const bg = {
-    blue: "bg-blue-100 dark:bg-blue-900/30",
-    amber: "bg-amber-100 dark:bg-amber-900/30",
-    emerald: "bg-emerald-100 dark:bg-emerald-900/30",
-  }[tone];
-  return (
-    <div className="bg-white dark:bg-slate-900 rounded-2xl p-4 border border-slate-200 dark:border-slate-800 shadow-sm">
-      <div className="flex items-center gap-2 mb-2">
-        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${bg}`}>{icon}</div>
-        <span className="text-xs text-slate-500 dark:text-slate-400">{label}</span>
-      </div>
-      <p className="text-xl font-bold text-slate-800 dark:text-white">{value}</p>
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setDialogOpen(false)}>
+              Cancelar
+            </Button>
+            <Button
+              className="bg-emerald-600 hover:bg-emerald-700 text-white"
+              onClick={handleDialogConfirmar}
+            >
+              <CheckCircle2 className="w-4 h-4 mr-1" />
+              Confirmar
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
